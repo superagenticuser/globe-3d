@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="description" content="Terra — an interactive 3D globe. Spin the Earth, explore cities, watch the live day-night terminator." />
+  <meta name="theme-color" content="#020409" />
+  <title>Terra — Interactive 3D Globe</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="scene"></div>
+  <div id="labels"></div>
+
+  <header class="hud hud-title">
+    <h1>TERRA</h1>
+    <p>Interactive 3D globe</p>
+    <p class="utc">UTC <span id="utcClock">--:--</span> · live sun</p>
+  </header>
+
+  <div class="hud hud-buttons">
+    <button id="btnRotate" class="pill active" title="Toggle auto-rotation">⟳ Spin</button>
+    <button id="btnReset" class="pill" title="Reset view">⤾ Reset</button>
+  </div>
+
+  <div class="hud hud-search">
+    <input id="search" type="search" placeholder="Search cities…" autocomplete="off" />
+    <div id="searchResults" class="hidden"></div>
+  </div>
+
+  <p class="hud hud-hint">Drag to spin · Scroll / pinch to zoom · Tap a marker</p>
+
+  <div id="cityCard" class="hidden">
+    <button id="cardClose" aria-label="Close">✕</button>
+    <h2 id="cardName"></h2>
+    <p id="cardCountry" class="country"></p>
+    <div class="card-grid">
+      <div><span>Local time</span><strong id="cardTime">--:--</strong></div>
+      <div><span>Population</span><strong id="cardPop"></strong></div>
+      <div><span>Latitude</span><strong id="cardLat"></strong></div>
+      <div><span>Longitude</span><strong id="cardLon"></strong></div>
+    </div>
+  </div>
+
+  <div id="loader">
+    <div class="spinner"></div>
+    <p>Loading Earth…</p>
+  </div>
+
+  <p class="credit">Imagery: NASA Visible Earth</p>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
