@@ -18,18 +18,31 @@ const CITIES = [
   { name: 'Sydney', country: 'Australia', lat: -33.87, lon: 151.21, pop: '5.3M', tz: 'Australia/Sydney' },
 ];
 
+// Major shipping lanes as [lat, lon] waypoint polylines.
+const LANES = [
+  [[35.7, 139.7], [30, 165], [28, 180], [25, -170], [22, -150], [25, -130], [33, -120]],
+  [[40.7, -74], [42, -50], [46, -30], [49, -12], [50.5, -1]],
+  [[1.35, 103.8], [5, 85], [8, 60], [12, 45], [15, 40], [27, 34], [31.5, 32.2], [36, 18], [36, 5], [35.8, -5.8]],
+  [[1.35, 103.8], [-5, 75], [-20, 55], [-33, 30], [-34.5, 19]],
+  [[34, -120], [20, -115], [5, -95], [-15, -80], [-33, -72]],
+];
+
 const R = 1;
 const UP = new THREE.Vector3(0, 1, 0);
 const CAM_DIR = new THREE.Vector3(0, 0, 1);
+const PLANE_WARP = 60;    // simulated air traffic time acceleration
+const SHIP_WARP = 600;    // simulated shipping time acceleration
 
 /* ---------------- Helpers ---------------- */
+// Matches three.js SphereGeometry UV mapping for standard equirectangular
+// earth textures (u=0.5 at lon 0, v=1 at north pole).
 function latLonToVec3(lat, lon, r) {
-  const phi = (90 - lat) * Math.PI / 180;   // polar angle
-  const sphPhi = Math.PI - lon * Math.PI / 180; // three.js sphere azimuth
+  const theta = (90 - lat) * Math.PI / 180;
+  const lam = lon * Math.PI / 180;
   return new THREE.Vector3(
-    -Math.cos(sphPhi) * Math.sin(phi) * r,
-    Math.cos(phi) * r,
-    Math.sin(sphPhi) * Math.sin(phi) * r
+    Math.cos(lam) * Math.sin(theta) * r,
+    Math.cos(theta) * r,
+    -Math.sin(lam) * Math.sin(theta) * r
   );
 }
 
@@ -52,13 +65,8 @@ function computeSunDir() {
   const lonDeg = (12 - utcH) * 15;
   const start = Date.UTC(now.getUTCFullYear(), 0, 0);
   const doy = Math.floor((now.getTime() - start) / 864e5);
-  const dec = -23.44 * Math.PI / 180 * Math.cos(2 * Math.PI * (doy + 10) / 365);
-  const lon = lonDeg * Math.PI / 180;
-  return new THREE.Vector3(
-    Math.cos(dec) * Math.cos(lon),
-    Math.sin(dec),
-    Math.cos(dec) * Math.sin(lon)
-  ).normalize();
+  const decDeg = -23.44 * Math.cos(2 * Math.PI * (doy + 10) / 365);
+  return latLonToVec3(decDeg, lonDeg, 1).normalize();
 }
 
 /* ---------------- Renderer / scene ---------------- */
@@ -83,12 +91,18 @@ camera.position.set(0, 0, targetDist);
 
 const world = new THREE.Group();
 scene.add(world);
+const trafficGroup = new THREE.Group();
+world.add(trafficGroup);
 
 /* ---------------- Textures & globe ---------------- */
 const texLoader = new THREE.TextureLoader();
 function loadTex(url) {
   return new Promise((resolve, reject) => {
-    texLoader.load(url, t => { t.colorSpace = THREE.SRGBColorSpace; t.anisotropy = 4; resolve(t); }, undefined, reject);
+    texLoader.load(url, t => {
+      t.colorSpace = THREE.SRGBColorSpace;
+      t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+      resolve(t);
+    }, undefined, reject);
   });
 }
 
@@ -152,8 +166,8 @@ function makeDotTexture() {
   const g = c.getContext('2d');
   const grad = g.createRadialGradient(32, 32, 2, 32, 32, 30);
   grad.addColorStop(0, 'rgba(255,255,255,1)');
-  grad.addColorStop(0.35, 'rgba(103,232,249,0.9)');
-  grad.addColorStop(1, 'rgba(103,232,249,0)');
+  grad.addColorStop(0.35, 'rgba(255,255,255,0.85)');
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
   g.fillStyle = grad;
   g.fillRect(0, 0, 64, 64);
   const t = new THREE.CanvasTexture(c);
@@ -188,7 +202,7 @@ function buildGraticule() {
 /* ---------------- Interaction state ---------------- */
 let dragging = false;
 let lastX = 0, lastY = 0;
-let velX = 0, velY = 0;           // inertia, in px/frame
+let velX = 0, velY = 0;
 let idleTime = 99;
 let autoRotate = true;
 let flying = false;
@@ -204,17 +218,22 @@ let downX = 0, downY = 0;
 const _qy = new THREE.Quaternion();
 const _qx = new THREE.Quaternion();
 const _q = new THREE.Quaternion();
+const _X = new THREE.Vector3(1, 0, 0);
 function rotateWorld(dxPx, dyPx) {
   _qy.setFromAxisAngle(UP, dxPx * 0.0052);
-  _qx.setFromAxisAngle(new THREE.Vector3(1, 0, 0), dyPx * 0.0052);
+  _qx.setFromAxisAngle(_X, dyPx * 0.0052);
   _q.copy(_qy).multiply(_qx);
   world.quaternion.premultiply(_q);
+}
+
+// Spin (and inertia) slows as you zoom in, so the surface speed feels constant.
+function zoomK() {
+  return THREE.MathUtils.clamp(camera.position.z / 3.1, 0.3, 1);
 }
 
 function flyTo(city) {
   flyFrom.copy(world.quaternion);
   flyToQ.copy(orientationFor(city.dir));
-  // shortest path
   if (flyFrom.dot(flyToQ) < 0) {
     flyToQ.set(-flyToQ.x, -flyToQ.y, -flyToQ.z, -flyToQ.w);
   }
@@ -275,7 +294,7 @@ searchInput.addEventListener('input', () => {
   if (!hits.length) {
     searchResults.innerHTML = '<div class="no-hit">No matches</div>';
   } else {
-    searchResults.innerHTML = hits.map((c, i) =>
+    searchResults.innerHTML = hits.map(c =>
       `<button data-i="${CITIES.indexOf(c)}">${c.name}<span>${c.country}</span></button>`
     ).join('');
   }
@@ -293,7 +312,7 @@ document.addEventListener('pointerdown', e => {
   if (!e.target.closest('.hud-search')) hideSearch();
 });
 
-/* ---------------- Buttons ---------------- */
+/* ---------------- Buttons & layers ---------------- */
 const btnRotate = document.getElementById('btnRotate');
 btnRotate.addEventListener('click', () => {
   autoRotate = !autoRotate;
@@ -308,6 +327,26 @@ document.getElementById('btnReset').addEventListener('click', () => {
   flyT = 0; flying = true;
   targetDist = 3.1;
 });
+
+const layers = {
+  planes: { on: true, obj: null, btn: document.getElementById('btnPlanes'), tag: document.querySelector('#btnPlanes .tag') },
+  ships: { on: true, obj: null, btn: document.getElementById('btnShips'), tag: document.querySelector('#btnShips .tag') },
+  sats: { on: true, obj: null, btn: document.getElementById('btnSats'), tag: document.querySelector('#btnSats .tag') },
+};
+for (const key of Object.keys(layers)) {
+  const L = layers[key];
+  L.btn.addEventListener('click', () => {
+    L.on = !L.on;
+    L.btn.classList.toggle('active', L.on);
+    if (L.obj) L.obj.visible = L.on;
+    if (key === 'sats' && issLabel) issLabel.style.display = 'none';
+  });
+}
+function setTag(key, text, live) {
+  const L = layers[key];
+  L.tag.textContent = text;
+  L.tag.classList.toggle('live', !!live);
+}
 
 /* ---------------- Pointer controls ---------------- */
 const raycaster = new THREE.Raycaster();
@@ -332,7 +371,6 @@ dom.addEventListener('pointerdown', e => {
 
 dom.addEventListener('pointermove', e => {
   if (!pointers.has(e.pointerId)) return;
-  const prev = pointers.get(e.pointerId);
   pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
   idleTime = 0;
   if (pointers.size === 2) {
@@ -377,26 +415,285 @@ function handleTap(x, y) {
 const _lv = new THREE.Vector3();
 const _lp = new THREE.Vector3();
 const _lc = new THREE.Vector3();
+let issLabel = null;
+let issWorld = new THREE.Vector3();
+
+function placeLabel(el, worldPos) {
+  _lc.copy(camera.position).sub(worldPos).normalize();
+  const facing = worldPos.clone().normalize().dot(_lc);
+  if (facing > 0.1) {
+    _lp.copy(worldPos).project(camera);
+    const x = (_lp.x * 0.5 + 0.5) * window.innerWidth;
+    const y = (-_lp.y * 0.5 + 0.5) * window.innerHeight;
+    el.style.transform = `translate(-50%,-140%) translate(${x.toFixed(1)}px,${y.toFixed(1)}px)`;
+    el.classList.add('visible');
+    return true;
+  }
+  el.classList.remove('visible');
+  return false;
+}
 
 function updateLabels() {
-  const w = window.innerWidth, h = window.innerHeight;
   const close = camera.position.z < 2.7;
   for (const mk of markers) {
     _lv.copy(mk.dir).applyQuaternion(world.quaternion);
-    _lc.copy(camera.position).sub(_lv).normalize();
-    const facing = _lv.clone().normalize().dot(_lc);
-    if (facing > 0.12) {
-      _lp.copy(_lv).project(camera);
-      const x = (_lp.x * 0.5 + 0.5) * w;
-      const y = (-_lp.y * 0.5 + 0.5) * h;
-      mk.el.style.transform = `translate(-50%,-140%) translate(${x.toFixed(1)}px,${y.toFixed(1)}px)`;
-      mk.el.classList.add('visible');
+    if (placeLabel(mk.el, _lv)) {
       mk.el.classList.toggle('named', close || (selectedCity && selectedCity.name === mk.city.name));
       mk.el.classList.toggle('selected', !!(selectedCity && selectedCity.name === mk.city.name));
-    } else {
-      mk.el.classList.remove('visible');
     }
   }
+  if (issLabel && layers.sats.on && satsLive.iss) {
+    _lv.copy(issWorld).applyQuaternion(world.quaternion);
+    placeLabel(issLabel, _lv);
+  } else if (issLabel) {
+    issLabel.classList.remove('visible');
+  }
+}
+
+/* ---------------- Traffic: planes (simulated) ---------------- */
+const _pa = new THREE.Vector3();
+const _pb = new THREE.Vector3();
+let planePts = null;
+const flights = [];
+
+function initPlanes(dotTex) {
+  const group = new THREE.Group();
+  const idx = [...CITIES.keys()];
+  const used = new Set();
+  let guard = 0;
+  while (flights.length < 26 && guard++ < 600) {
+    const a = idx[(Math.random() * idx.length) | 0];
+    const b = idx[(Math.random() * idx.length) | 0];
+    if (a === b) continue;
+    const key = a < b ? a + '-' + b : b + '-' + a;
+    if (used.has(key)) continue;
+    used.add(key);
+    const A = CITIES[a].dir, B = CITIES[b].dir;
+    const km = A.angleTo(B) * 6371;
+    flights.push({ a: A, b: B, t: Math.random(), dur: (km / 880) * 3600 / PLANE_WARP });
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(flights.length * 3), 3));
+  planePts = new THREE.Points(geo, new THREE.PointsMaterial({
+    size: 0.024, map: dotTex, color: 0xfde68a, transparent: true,
+    depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true,
+  }));
+  planePts.frustumCulled = false;
+  group.add(planePts);
+  trafficGroup.add(group);
+  layers.planes.obj = group;
+  setTag('planes', 'SIM ×60', false);
+  layers.planes.btn.title = 'Aircraft — simulated scheduled flights (time ×60)';
+}
+
+function updatePlanes(dt) {
+  if (!planePts || !layers.planes.on) return;
+  const pos = planePts.geometry.attributes.position;
+  flights.forEach((f, i) => {
+    f.t += dt / f.dur;
+    if (f.t >= 1) { const tmp = f.a; f.a = f.b; f.b = tmp; f.t = 0; }
+    _pa.copy(f.a).lerp(f.b, f.t).normalize().multiplyScalar(1.022);
+    pos.setXYZ(i, _pa.x, _pa.y, _pa.z);
+  });
+  pos.needsUpdate = true;
+}
+
+/* ---------------- Traffic: ships (simulated) ---------------- */
+let shipPts = null;
+const ships = [];
+const laneData = [];
+
+function initShips(dotTex) {
+  const group = new THREE.Group();
+  for (const lane of LANES) {
+    const pts = lane.map(([la, lo]) => latLonToVec3(la, lo, 1));
+    const cum = [0];
+    for (let i = 1; i < pts.length; i++) cum.push(cum[i - 1] + pts[i - 1].angleTo(pts[i]));
+    laneData.push({ pts, cum, total: cum[cum.length - 1] });
+  }
+  const vKms = (45 * SHIP_WARP) / 3600; // km/s effective
+  for (let i = 0; i < 16; i++) {
+    const li = i % laneData.length;
+    ships.push({ lane: laneData[li], s: Math.random() * laneData[li].total, v: vKms / 6371, dir: 1 });
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(ships.length * 3), 3));
+  shipPts = new THREE.Points(geo, new THREE.PointsMaterial({
+    size: 0.02, map: dotTex, color: 0x6ee7b7, transparent: true,
+    depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true,
+  }));
+  shipPts.frustumCulled = false;
+  group.add(shipPts);
+  trafficGroup.add(group);
+  layers.ships.obj = group;
+  setTag('ships', 'SIM ×600', false);
+  layers.ships.btn.title = 'Ships — simulated along major shipping lanes (time ×600)';
+}
+
+const _sp = new THREE.Vector3();
+function lanePoint(lane, s, out) {
+  const { pts, cum, total } = lane;
+  let t = ((s % total) + total) % total;
+  let i = 1;
+  while (i < cum.length - 1 && cum[i] < t) i++;
+  const f = (t - cum[i - 1]) / Math.max(cum[i] - cum[i - 1], 1e-9);
+  return out.copy(pts[i - 1]).lerp(pts[i], f).normalize();
+}
+
+function updateShips(dt) {
+  if (!shipPts || !layers.ships.on) return;
+  const pos = shipPts.geometry.attributes.position;
+  ships.forEach((sh, i) => {
+    sh.s += sh.v * dt * sh.dir;
+    lanePoint(sh.lane, sh.s, _sp).multiplyScalar(1.004);
+    pos.setXYZ(i, _sp.x, _sp.y, _sp.z);
+  });
+  pos.needsUpdate = true;
+}
+
+/* ---------------- Traffic: satellites (LIVE TLE) ---------------- */
+const satsLive = { list: [], live: false, iss: null, sim: false };
+let satPts = null;
+let satTimer = 0;
+
+function initSatellites(dotTex) {
+  const group = new THREE.Group();
+  trafficGroup.add(group);
+  layers.sats.obj = group;
+
+  issLabel = document.createElement('div');
+  issLabel.className = 'iss-label';
+  issLabel.textContent = 'ISS · LIVE';
+  labelsEl.appendChild(issLabel);
+
+  fetch('https://celestrak.org/NORAD/elements/gp.php?GROUP=stations&FORMAT=tle')
+    .then(r => { if (!r.ok) throw new Error('TLE ' + r.status); return r.text(); })
+    .then(text => {
+      const lines = text.trim().split('\n');
+      for (let i = 0; i + 2 < lines.length; i += 3) {
+        const name = lines[i].trim();
+        const l1 = lines[i + 1], l2 = lines[i + 2];
+        if (!l1 || !l2 || !l1.startsWith('1 ') || !l2.startsWith('2 ')) continue;
+        try {
+          satsLive.list.push({ name, satrec: window.satellite.twoline2satrec(l1, l2), iss: /ISS/.test(name) });
+        } catch (e) { /* skip bad TLE */ }
+      }
+      if (!satsLive.list.length) throw new Error('empty TLE set');
+      satsLive.live = true;
+      buildSatPoints(group, dotTex);
+      buildGroundTracks(group);
+      setTag('sats', 'LIVE', true);
+      layers.sats.btn.title = 'Satellites — live positions from CelesTrak TLE data';
+      updateSatPositions();
+    })
+    .catch(err => {
+      console.warn('Live satellites unavailable, using simulated shell:', err);
+      buildSimSats(group, dotTex);
+      setTag('sats', 'SIM', false);
+      layers.sats.btn.title = 'Satellites — simulated (live feed unreachable)';
+    });
+}
+
+function buildSatPoints(group, dotTex) {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(new Float32Array(satsLive.list.length * 3), 3));
+  satPts = new THREE.Points(geo, new THREE.PointsMaterial({
+    size: 0.028, map: dotTex, color: 0xf0abfc, transparent: true,
+    depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true,
+  }));
+  satPts.frustumCulled = false;
+  group.add(satPts);
+  const iss = satsLive.list.find(s => s.iss);
+  if (iss) satsLive.iss = iss;
+}
+
+function satLatLon(s, date) {
+  const pv = window.satellite.propagate(s.satrec, date);
+  if (!pv || !pv.position) return null;
+  const gmst = window.satellite.gstime(date);
+  const gd = window.satellite.eciToGeodetic(pv.position, gmst);
+  return {
+    lat: gd.latitude * 180 / Math.PI,
+    lon: gd.longitude * 180 / Math.PI,
+    h: Math.max(gd.height, 0),
+  };
+}
+
+function updateSatPositions() {
+  if (!satPts || !satsLive.live) return;
+  const now = new Date();
+  const pos = satPts.geometry.attributes.position;
+  const v = new THREE.Vector3();
+  satsLive.list.forEach((s, i) => {
+    const ll = satLatLon(s, now);
+    if (!ll) return;
+    v.copy(latLonToVec3(ll.lat, ll.lon, 1 + ll.h / 6371));
+    pos.setXYZ(i, v.x, v.y, v.z);
+    if (s === satsLive.iss) issWorld.copy(v);
+  });
+  pos.needsUpdate = true;
+}
+
+// Faint ground-track for the next 45 minutes of each satellite.
+function buildGroundTracks(group) {
+  const now = new Date();
+  const mat = new THREE.LineBasicMaterial({ color: 0xf0abfc, transparent: true, opacity: 0.10, depthWrite: false });
+  for (const s of satsLive.list) {
+    const pts = [];
+    for (let k = 0; k <= 48; k++) {
+      const d = new Date(now.getTime() + (k * 45 * 60000) / 48);
+      const ll = satLatLon(s, d);
+      if (!ll) break;
+      pts.push(latLonToVec3(ll.lat, ll.lon, 1 + ll.h / 6371 + 0.002));
+    }
+    if (pts.length > 1) {
+      const g = new THREE.BufferGeometry().setFromPoints(pts);
+      const line = new THREE.Line(g, mat);
+      line.frustumCulled = false;
+      group.add(line);
+    }
+  }
+}
+
+// Fallback: decorative LEO shell when the TLE feed is unreachable.
+function buildSimSats(group, dotTex) {
+  satsLive.sim = true;
+  const N = 40;
+  const t0 = Date.now() / 1000;
+  for (let i = 0; i < N; i++) {
+    const inc = Math.random() * 1.9;
+    const node = Math.random() * Math.PI * 2;
+    const r = 1.055 + Math.random() * 0.05;
+    const u = new THREE.Vector3(Math.cos(node), 0, Math.sin(node));
+    const v = new THREE.Vector3(-Math.sin(node) * Math.cos(inc), Math.sin(inc), Math.cos(node) * Math.cos(inc));
+    const w = (2 * Math.PI) / (92 * 60) * 8; // ×8 for visibility
+    satsLive.list.push({ sim: true, u, v, r, w, phase: Math.random() * Math.PI * 2, t0 });
+  }
+  buildSatPoints(group, dotTex);
+  const mat = new THREE.LineBasicMaterial({ color: 0xf0abfc, transparent: true, opacity: 0.08, depthWrite: false });
+  for (const s of satsLive.list) {
+    const pts = [];
+    for (let k = 0; k <= 64; k++) {
+      const a = (k / 64) * Math.PI * 2;
+      pts.push(new THREE.Vector3().addScaledVector(s.u, Math.cos(a) * s.r).addScaledVector(s.v, Math.sin(a) * s.r));
+    }
+    const line = new THREE.Line(new THREE.BufferGeometry().setFromPoints(pts), mat);
+    line.frustumCulled = false;
+    group.add(line);
+  }
+}
+
+function updateSimSats() {
+  if (!satPts || !satsLive.sim) return;
+  const t = Date.now() / 1000 - satsLive.list[0].t0;
+  const pos = satPts.geometry.attributes.position;
+  const v = new THREE.Vector3();
+  satsLive.list.forEach((s, i) => {
+    const a = s.phase + s.w * t;
+    v.addScaledVector(s.u, Math.cos(a) * s.r).addScaledVector(s.v, Math.sin(a) * s.r);
+    pos.setXYZ(i, v.x, v.y, v.z);
+  });
+  pos.needsUpdate = true;
 }
 
 /* ---------------- Clock ---------------- */
@@ -428,16 +725,27 @@ function animate() {
     world.quaternion.slerpQuaternions(flyFrom, flyToQ, easeInOut(t));
     if (t >= 1) flying = false;
   } else if (!dragging) {
+    const zk = zoomK();
     if (Math.abs(velX) > 0.01 || Math.abs(velY) > 0.01) {
-      rotateWorld(velX * dt * 60, velY * dt * 60);
+      rotateWorld(velX * dt * 60 * zk, velY * dt * 60 * zk);
       const d = Math.pow(0.93, dt * 60);
       velX *= d; velY *= d;
     } else if (autoRotate && idleTime > 3.5) {
-      rotateWorld(dt * 14, 0);
+      rotateWorld(dt * 10 * zk, 0);
     }
   }
 
   camera.position.z += (targetDist - camera.position.z) * Math.min(1, dt * 8);
+
+  updatePlanes(dt);
+  updateShips(dt);
+  if (satsLive.live && layers.sats.on) {
+    satTimer += dt;
+    if (satTimer > 0.5) { satTimer = 0; updateSatPositions(); }
+  } else if (satsLive.sim) {
+    updateSimSats();
+  }
+
   updateLabels();
   renderer.render(scene, camera);
 }
@@ -457,7 +765,6 @@ function animate() {
     world.add(globe);
     world.add(buildGraticule());
 
-    // Atmosphere glow
     const atm = new THREE.Mesh(
       new THREE.SphereGeometry(R * 1.22, 64, 64),
       new THREE.ShaderMaterial({
@@ -483,14 +790,12 @@ function animate() {
     );
     scene.add(atm);
 
-    // Starfield
     const stars = new THREE.Mesh(
       new THREE.SphereGeometry(90, 32, 32),
       new THREE.MeshBasicMaterial({ map: skyTex, side: THREE.BackSide, depthWrite: false })
     );
     scene.add(stars);
 
-    // Markers
     const dotTex = makeDotTexture();
     for (const city of CITIES) {
       city.dir = latLonToVec3(city.lat, city.lon, 1);
@@ -518,7 +823,10 @@ function animate() {
       markers.push({ city, dir: city.dir, el });
     }
 
-    // Start facing Port Louis (home waters), north up
+    initPlanes(dotTex);
+    initShips(dotTex);
+    initSatellites(dotTex);
+
     world.quaternion.copy(orientationFor(CITIES[0].dir));
 
     document.getElementById('loader').classList.add('done');

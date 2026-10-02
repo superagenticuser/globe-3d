@@ -21,6 +21,9 @@
   <div class="hud hud-buttons">
     <button id="btnRotate" class="pill active" title="Toggle auto-rotation">⟳ Spin</button>
     <button id="btnReset" class="pill" title="Reset view">⤾ Reset</button>
+    <button id="btnPlanes" class="pill layer active" title="Aircraft">✈<span class="tag"></span></button>
+    <button id="btnShips" class="pill layer active" title="Ships">🚢<span class="tag"></span></button>
+    <button id="btnSats" class="pill layer active" title="Satellites">🛰<span class="tag"></span></button>
   </div>
 
   <div class="hud hud-search">
@@ -47,8 +50,9 @@
     <p>Loading Earth…</p>
   </div>
 
-  <p class="credit">Imagery: NASA Visible Earth</p>
+  <p class="credit">Imagery: NASA Visible Earth · Satellites: CelesTrak</p>
 
+  <script src="satellite.min.js"></script>
   <script type="module" src="app.js"></script>
 </body>
 </html>
